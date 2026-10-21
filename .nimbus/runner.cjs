@@ -33,14 +33,14 @@ __export(main_exports, {
   main: () => main
 });
 module.exports = __toCommonJS(main_exports);
-var import_node_fs8 = require("node:fs");
-var import_promises5 = require("node:fs/promises");
-var import_node_os = require("node:os");
-var import_node_path12 = require("node:path");
-var import_node_crypto2 = require("node:crypto");
-var import_promises6 = require("node:stream/promises");
-var import_node_stream2 = require("node:stream");
-var import_node_zlib2 = require("node:zlib");
+var import_node_fs10 = require("node:fs");
+var import_promises9 = require("node:fs/promises");
+var import_node_os2 = require("node:os");
+var import_node_path14 = require("node:path");
+var import_node_crypto3 = require("node:crypto");
+var import_promises10 = require("node:stream/promises");
+var import_node_stream4 = require("node:stream");
+var import_node_zlib3 = require("node:zlib");
 
 // ../../node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/classic/external.js
 var external_exports = {};
@@ -5109,7 +5109,7 @@ var recursive = /* @__PURE__ */ new WeakMap();
 var NONE = 0;
 var ASSUMED = 1;
 var PROVEN = 2;
-function isRecursive(inst, stack, resolve3) {
+function isRecursive(inst, stack, resolve4) {
   const cached2 = recursive.get(inst);
   if (cached2 !== void 0)
     return cached2 ? PROVEN : NONE;
@@ -5119,7 +5119,7 @@ function isRecursive(inst, stack, resolve3) {
   let result = NONE;
   const check2 = (child) => {
     if (result !== PROVEN && child?._zod) {
-      const answer = isRecursive(child, stack, resolve3);
+      const answer = isRecursive(child, stack, resolve4);
       if (answer > result)
         result = answer;
     }
@@ -5130,7 +5130,7 @@ function isRecursive(inst, stack, resolve3) {
       const desc = Object.getOwnPropertyDescriptor(sh, key);
       if (spread && !desc.enumerable)
         continue;
-      const child = desc.get ? ASSUMED : desc.value?._zod ? isRecursive(desc.value, stack, resolve3) : NONE;
+      const child = desc.get ? ASSUMED : desc.value?._zod ? isRecursive(desc.value, stack, resolve4) : NONE;
       if (child > answer)
         answer = child;
     }
@@ -5194,7 +5194,7 @@ function isRecursive(inst, stack, resolve3) {
       break;
     // `$ZodLazy` caches its inner on the def, so a resolved edge is followed exactly
     case "lazy": {
-      const inner = def._cachedInner ?? (resolve3 ? inst._zod.innerType : void 0);
+      const inner = def._cachedInner ?? (resolve4 ? inst._zod.innerType : void 0);
       merge2(inner ? isRecursive(inner, stack, false) : ASSUMED);
       break;
     }
@@ -19794,6 +19794,9 @@ var RUNNERS = [
 ];
 var MAX_UPLOAD_BYTES = 5 * 1024 ** 3;
 var MAX_ENTRIES = 5e3;
+var CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1e3;
+var MAX_CACHE_ENTRIES = 1e5;
+var MAX_CACHE_EXPANDED_BYTES = 20 * 1024 ** 3;
 function safePath(path) {
   return path.length > 0 && path.length <= 500 && !/[\\:\x00-\x1f\x7f<>"|?*]/.test(path) && path.split("/").every(
     (p2) => p2 && p2 !== "." && p2 !== ".." && !/[. ]$/.test(p2) && !/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(p2)
@@ -19808,6 +19811,27 @@ var inputSchema = external_exports.object({
   sourcePath: relativePath.optional(),
   target: relativePath
 }).strict();
+var cacheKeySchema = external_exports.string().min(1).max(512).refine((key) => !/[\x00-\x1f\x7f]/.test(key), "Invalid cache key");
+var cachePathSchema = external_exports.string().min(1).max(500).transform((path) => path.replaceAll("\\", "/").replace(/\/+$/, "")).refine((path) => {
+  const relative2 = path.replace(/^(?:~\/|[A-Za-z]:\/|\/)/, "");
+  return safePath(relative2) && !relative2.split("/").includes("~") && !path.startsWith("//");
+}, "Cache paths must name directories without traversal, globs or root paths");
+var cacheSchema = external_exports.object({
+  key: cacheKeySchema,
+  paths: external_exports.array(cachePathSchema).min(1).max(10),
+  restoreKeys: external_exports.array(cacheKeySchema).max(10).default([])
+}).strict();
+var cacheReportSchema = external_exports.object({
+  index: external_exports.number().int().min(0).max(9),
+  key: cacheKeySchema,
+  restore: external_exports.enum(["exact", "prefix", "miss", "error"]),
+  matchedKey: cacheKeySchema.optional(),
+  save: external_exports.enum(["skipped", "pending", "saved", "discarded", "error"]),
+  size: external_exports.number().int().nonnegative().max(MAX_UPLOAD_BYTES).optional(),
+  restoreMs: external_exports.number().int().nonnegative().optional(),
+  saveMs: external_exports.number().int().nonnegative().optional(),
+  warning: external_exports.string().max(1e3).optional()
+}).strict();
 var taskSchema = external_exports.object({
   runner: external_exports.string().refine(
     (label) => RUNNERS.some((r) => r.label === label),
@@ -19820,8 +19844,21 @@ var taskSchema = external_exports.object({
     external_exports.string().max(16384)
   ).default({}),
   timeoutMinutes: external_exports.number().int().positive().default(60),
-  inputs: external_exports.array(inputSchema).max(100).default([])
+  inputs: external_exports.array(inputSchema).max(100).default([]),
+  caches: external_exports.array(cacheSchema).max(10).optional()
 }).strict().superRefine((value, ctx) => {
+  const caches = value.caches ?? [];
+  const cachePaths = caches.flatMap((cache) => cache.paths).map((p2) => p2.toLowerCase());
+  if (new Set(caches.map((cache) => cache.key)).size !== caches.length || cachePaths.some(
+    (p2, i) => cachePaths.some(
+      (q2, j2) => i !== j2 && (p2 === q2 || p2.startsWith(q2 + "/"))
+    )
+  ) || cachePaths.some((p2) => /^(inputs|out)(\/|$)/.test(p2)))
+    ctx.addIssue({
+      code: "custom",
+      path: ["caches"],
+      message: "Cache keys must be unique; directories must not overlap each other, inputs or out"
+    });
   const runner = RUNNERS.find((r) => r.label === value.runner);
   if (runner && value.timeoutMinutes > runner.maxMinutes)
     ctx.addIssue({
@@ -19891,7 +19928,8 @@ var resultSchema = external_exports.object({
   exitCode: external_exports.number().int().nullable(),
   error: external_exports.string().max(4e3).optional(),
   artifactId: external_exports.string().uuid().optional(),
-  logId: external_exports.string().uuid().optional()
+  logId: external_exports.string().uuid().optional(),
+  caches: external_exports.array(cacheReportSchema).max(10).optional()
 }).strict();
 
 // src/archive.ts
@@ -22875,22 +22913,22 @@ async function inventory(root) {
   if (!(await (0, import_promises2.lstat)(root)).isDirectory() || (await (0, import_promises2.lstat)(root)).isSymbolicLink())
     throw new Error("Output root must be a directory");
   const entries = [];
-  async function walk(relative) {
-    for (const name of (await (0, import_promises2.readdir)((0, import_node_path10.resolve)(root, relative))).sort()) {
-      const path = relative ? `${relative}/${name}` : name;
+  async function walk(relative2) {
+    for (const name of (await (0, import_promises2.readdir)((0, import_node_path10.resolve)(root, relative2))).sort()) {
+      const path = relative2 ? `${relative2}/${name}` : name;
       if (!safePath(path)) throw new Error("Unsafe output path");
-      const stat2 = await (0, import_promises2.lstat)((0, import_node_path10.resolve)(root, path));
-      if (!stat2.isFile() && !stat2.isDirectory() || stat2.isFile() && stat2.nlink > 1)
+      const stat3 = await (0, import_promises2.lstat)((0, import_node_path10.resolve)(root, path));
+      if (!stat3.isFile() && !stat3.isDirectory() || stat3.isFile() && stat3.nlink > 1)
         throw new Error("Symlinks and special output files are not supported");
       entries.push({
         path,
-        type: stat2.isDirectory() ? "directory" : "file",
-        size: stat2.isFile() ? stat2.size : 0,
-        mode: stat2.mode & 511
+        type: stat3.isDirectory() ? "directory" : "file",
+        size: stat3.isFile() ? stat3.size : 0,
+        mode: stat3.mode & 511
       });
       if (entries.length > MAX_ENTRIES)
         throw new Error(`Output exceeds ${MAX_ENTRIES} entries`);
-      if (stat2.isDirectory()) await walk(path);
+      if (stat3.isDirectory()) await walk(path);
     }
   }
   await walk("");
@@ -22906,7 +22944,7 @@ async function pack(root, destination) {
         strict: true,
         noDirRecurse: true,
         follow: false,
-        filter: (_path, stat2) => !("type" in stat2) && (stat2.isDirectory() || stat2.isFile() && stat2.nlink === 1)
+        filter: (_path, stat3) => !("type" in stat3) && (stat3.isDirectory() || stat3.isFile() && stat3.nlink === 1)
       },
       [".", ...entries.map((e) => e.path)]
     ),
@@ -23044,7 +23082,7 @@ async function runScript(spec, pat, cwd, control, logPath) {
   const args = powershell ? ["-NoLogo", "-NoProfile", "-NonInteractive", "-File", script] : interpreter === "bash" ? ["--noprofile", "--norc", script] : [script];
   const log = await (0, import_promises4.open)(logPath, "a");
   try {
-    return await new Promise((resolve3, reject) => {
+    return await new Promise((resolve4, reject) => {
       const child = (0, import_node_child_process.spawn)(interpreter, args, {
         cwd,
         env: taskEnvironment(process.env, spec.env, pat, helper),
@@ -23055,23 +23093,452 @@ async function runScript(spec, pat, cwd, control, logPath) {
         "error",
         () => reject(new Error("Interpreter unavailable or failed to start"))
       );
-      child.once("exit", (code) => resolve3(code ?? 1));
+      child.once("exit", (code) => resolve4(code ?? 1));
     });
   } finally {
     await log.close();
   }
 }
 
+// src/cache.ts
+var import_node_fs9 = require("node:fs");
+var import_promises7 = require("node:fs/promises");
+var import_node_crypto2 = require("node:crypto");
+var import_node_path13 = require("node:path");
+var import_node_stream3 = require("node:stream");
+var import_promises8 = require("node:stream/promises");
+
+// src/cache-archive.ts
+var import_node_fs8 = require("node:fs");
+var import_promises5 = require("node:fs/promises");
+var import_node_path12 = require("node:path");
+var import_node_os = require("node:os");
+var import_node_stream2 = require("node:stream");
+var import_promises6 = require("node:stream/promises");
+var import_node_zlib2 = require("node:zlib");
+var inside = (root, path) => path === root || path.startsWith(root + import_node_path12.sep);
+var overlaps = (a, b2) => inside(a, b2) || inside(b2, a);
+var absent = (error62) => error62.code === "ENOENT";
+async function canonical(path) {
+  try {
+    return await (0, import_promises5.realpath)(path);
+  } catch (error62) {
+    if (!absent(error62)) throw error62;
+    const parent = (0, import_node_path12.dirname)(path);
+    if (parent === path) throw error62;
+    return (0, import_node_path12.join)(
+      await canonical(parent),
+      path.slice(parent.length + (parent.endsWith(import_node_path12.sep) ? 0 : 1))
+    );
+  }
+}
+async function cacheDirectories(paths, work, control, home = (0, import_node_os.homedir)()) {
+  const forbidden = await Promise.all(
+    [(0, import_node_path12.join)(work, "inputs"), (0, import_node_path12.join)(work, "out"), control].map(canonical)
+  );
+  const roots = [];
+  for (const path of paths) {
+    if (process.platform !== "win32" && /^[A-Za-z]:\//.test(path))
+      throw new Error("Cache path belongs to another operating system");
+    const expanded = path.startsWith("~/") ? (0, import_node_path12.join)(home, path.slice(2)) : (0, import_node_path12.isAbsolute)(path) ? path : (0, import_node_path12.resolve)(work, path);
+    const info = await (0, import_promises5.lstat)(expanded).catch((error62) => {
+      if (!absent(error62)) throw error62;
+    });
+    if (info && (!info.isDirectory() || info.isSymbolicLink()))
+      throw new Error("Cache root must be a directory, not a link");
+    const root = await canonical(expanded);
+    if (root === (0, import_node_path12.dirname)(root) || root === await canonical(home) || forbidden.some((p2) => overlaps(p2, root)) || roots.some((p2) => overlaps(p2, root)))
+      throw new Error(
+        "Cache directories overlap protected paths or each other"
+      );
+    roots.push(root);
+  }
+  return roots;
+}
+function byteLimit(max) {
+  let size = 0;
+  return new import_node_stream2.Transform({
+    transform(chunk, _encoding, done) {
+      size += chunk.length;
+      done(size > max ? new Error("Cache exceeds size limit") : null, chunk);
+    }
+  });
+}
+async function packCache(roots, archive, control, signal) {
+  const stage = await (0, import_promises5.mkdtemp)((0, import_node_path12.join)(control, "cache-pack-"));
+  let count = 0;
+  let bytes = 0;
+  const names = [];
+  async function copy(source, dest, root) {
+    signal.throwIfAborted();
+    if (++count > MAX_CACHE_ENTRIES)
+      throw new Error("Cache exceeds entry limit");
+    const info = await (0, import_promises5.lstat)(source);
+    if (info.isSymbolicLink()) {
+      const target = (0, import_node_path12.resolve)((0, import_node_path12.dirname)(source), await (0, import_promises5.readlink)(source));
+      if (!inside(root, target) || !inside(root, await (0, import_promises5.realpath)(target)))
+        throw new Error("Cache link escapes its directory");
+      await (0, import_promises5.symlink)(
+        (0, import_node_path12.relative)((0, import_node_path12.dirname)(source), target) || ".",
+        dest,
+        (await (0, import_promises5.lstat)(await (0, import_promises5.realpath)(target))).isDirectory() ? "dir" : "file"
+      );
+      return;
+    }
+    if (info.isDirectory()) {
+      await (0, import_promises5.mkdir)(dest);
+      for (const name of (await (0, import_promises5.readdir)(source)).sort()) {
+        if (!safePath(name)) throw new Error("Unsupported cache filename");
+        await copy((0, import_node_path12.join)(source, name), (0, import_node_path12.join)(dest, name), root);
+      }
+    } else if (info.isFile()) {
+      bytes += info.size;
+      if (bytes > MAX_CACHE_EXPANDED_BYTES)
+        throw new Error("Cache exceeds expanded size limit");
+      await (0, import_promises5.copyFile)(source, dest);
+    } else throw new Error("Special cache files are unsupported");
+    await (0, import_promises5.chmod)(dest, info.mode & 511);
+    await (0, import_promises5.utimes)(dest, info.atime, info.mtime);
+  }
+  try {
+    for (const [i, root] of roots.entries()) {
+      signal.throwIfAborted();
+      const info = await (0, import_promises5.lstat)(root).catch((error62) => {
+        if (!absent(error62)) throw error62;
+      });
+      if (!info) continue;
+      if (!info.isDirectory() || info.isSymbolicLink() || await (0, import_promises5.realpath)(root) !== root)
+        throw new Error("Cache directory changed");
+      const name = String(i);
+      await copy(root, (0, import_node_path12.join)(stage, name), root);
+      names.push(name);
+    }
+    if (!names.length) return false;
+    await (0, import_promises6.pipeline)(
+      Qn({ cwd: stage, portable: true, strict: true, follow: false }, names),
+      (0, import_node_zlib2.createZstdCompress)({
+        params: { [import_node_zlib2.constants.ZSTD_c_compressionLevel]: 3 }
+      }),
+      byteLimit(MAX_UPLOAD_BYTES),
+      (0, import_node_fs8.createWriteStream)(archive, { flags: "wx" }),
+      { signal }
+    );
+    return true;
+  } finally {
+    await (0, import_promises5.rm)(stage, { recursive: true, force: true });
+  }
+}
+async function unpackCache(archive, roots, control, signal) {
+  const entries = /* @__PURE__ */ new Map();
+  const lower = /* @__PURE__ */ new Set();
+  let bytes = 0;
+  let invalid = false;
+  await (0, import_promises6.pipeline)(
+    (0, import_node_fs8.createReadStream)(archive),
+    (0, import_node_zlib2.createZstdDecompress)(),
+    byteLimit(MAX_CACHE_EXPANDED_BYTES + MAX_CACHE_ENTRIES * 2048),
+    Ct({
+      strict: true,
+      onReadEntry(entry) {
+        const path = entry.path.replace(/\/$/, "");
+        const root = path.split("/")[0];
+        bytes += entry.size;
+        if (!safePath(path) || !/^(0|[1-9]\d*)$/.test(root) || Number(root) >= roots.length || lower.has(path.toLowerCase()) || entries.size >= MAX_CACHE_ENTRIES || bytes > MAX_CACHE_EXPANDED_BYTES || !["File", "Directory", "SymbolicLink"].includes(entry.type) || path === root && entry.type !== "Directory") {
+          invalid = true;
+          return;
+        }
+        let link;
+        if (entry.type === "SymbolicLink") {
+          link = entry.linkpath ?? "";
+          const target = import_node_path12.posix.normalize(import_node_path12.posix.join(import_node_path12.posix.dirname(path), link));
+          if (!link || /[\\:\x00-\x1f\x7f]/.test(link) || import_node_path12.posix.isAbsolute(link) || !(target === root || target.startsWith(root + "/")))
+            invalid = true;
+        }
+        lower.add(path.toLowerCase());
+        entries.set(path, {
+          path,
+          type: entry.type,
+          mode: (entry.mode ?? 0) & 511,
+          mtime: entry.mtime ?? void 0,
+          link
+        });
+      }
+    }),
+    { signal }
+  );
+  for (const entry of entries.values()) {
+    let parent = import_node_path12.posix.dirname(entry.path);
+    while (parent !== ".") {
+      if (entries.get(parent)?.type !== "Directory") invalid = true;
+      parent = import_node_path12.posix.dirname(parent);
+    }
+  }
+  if (invalid || !entries.size) throw new Error("Invalid cache archive");
+  const stage = await (0, import_promises5.mkdtemp)((0, import_node_path12.join)(control, "cache-extract-"));
+  const prepared = [];
+  let committed = false;
+  try {
+    await (0, import_promises6.pipeline)(
+      (0, import_node_fs8.createReadStream)(archive),
+      (0, import_node_zlib2.createZstdDecompress)(),
+      byteLimit(MAX_CACHE_EXPANDED_BYTES + MAX_CACHE_ENTRIES * 2048),
+      So({
+        cwd: stage,
+        strict: true,
+        preservePaths: false,
+        preserveOwner: false,
+        noChmod: true,
+        filter: (raw) => entries.get(raw.replace(/\/$/, ""))?.type !== "SymbolicLink"
+      }),
+      { signal }
+    );
+    for (const entry of entries.values()) {
+      signal.throwIfAborted();
+      if (entry.link)
+        await (0, import_promises5.symlink)(
+          entry.link,
+          (0, import_node_path12.resolve)(stage, entry.path),
+          entries.get(
+            import_node_path12.posix.normalize(import_node_path12.posix.join(import_node_path12.posix.dirname(entry.path), entry.link))
+          )?.type === "Directory" ? "dir" : "file"
+        );
+    }
+    for (const entry of [...entries.values()].sort(
+      (a, b2) => b2.path.length - a.path.length
+    )) {
+      if (entry.type === "SymbolicLink") continue;
+      await (0, import_promises5.chmod)((0, import_node_path12.resolve)(stage, entry.path), entry.mode);
+      if (entry.mtime)
+        await (0, import_promises5.utimes)((0, import_node_path12.resolve)(stage, entry.path), entry.mtime, entry.mtime);
+    }
+    for (const [i, target] of roots.entries()) {
+      if (!entries.has(String(i))) continue;
+      signal.throwIfAborted();
+      if (await canonical(target) !== target)
+        throw new Error("Cache target changed");
+      await (0, import_promises5.mkdir)((0, import_node_path12.dirname)(target), { recursive: true });
+      const temp = await (0, import_promises5.mkdtemp)((0, import_node_path12.join)((0, import_node_path12.dirname)(target), ".nimbus-cache-"));
+      const item = { target, temp, previous: false, installed: false };
+      prepared.push(item);
+      await (0, import_promises5.cp)((0, import_node_path12.join)(stage, String(i)), (0, import_node_path12.join)(temp, "new"), {
+        recursive: true,
+        preserveTimestamps: true,
+        verbatimSymlinks: true
+      });
+    }
+    for (const item of prepared) {
+      signal.throwIfAborted();
+      if (await canonical(item.target) !== item.target)
+        throw new Error("Cache target changed");
+      try {
+        await (0, import_promises5.rename)(item.target, (0, import_node_path12.join)(item.temp, "old"));
+        item.previous = true;
+      } catch (error62) {
+        if (!absent(error62)) throw error62;
+      }
+      await (0, import_promises5.rename)((0, import_node_path12.join)(item.temp, "new"), item.target);
+      item.installed = true;
+    }
+    committed = true;
+  } catch (error62) {
+    for (const item of [...prepared].reverse()) {
+      try {
+        if (item.installed)
+          await (0, import_promises5.rm)(item.target, { recursive: true, force: true });
+        if (item.previous) {
+          await (0, import_promises5.rename)((0, import_node_path12.join)(item.temp, "old"), item.target);
+          item.previous = false;
+        }
+      } catch {
+      }
+    }
+    throw error62;
+  } finally {
+    await (0, import_promises5.rm)(stage, { recursive: true, force: true });
+    for (const item of prepared)
+      if (committed || !item.previous)
+        await (0, import_promises5.rm)(item.temp, { recursive: true, force: true });
+  }
+}
+
+// src/cache.ts
+async function cacheChecksum(file2, signal) {
+  const hash2 = (0, import_node_crypto2.createHash)("md5");
+  for await (const chunk of (0, import_node_fs9.createReadStream)(file2, { signal }))
+    hash2.update(chunk);
+  return hash2.digest("base64");
+}
+var TaskCache = class {
+  constructor(specs, call, work, control, log) {
+    this.specs = specs;
+    this.call = call;
+    this.work = work;
+    this.control = control;
+    this.log = log;
+    this.reports = specs.map((spec, index) => ({
+      index,
+      key: spec.key,
+      restore: "miss",
+      save: "skipped"
+    }));
+  }
+  specs;
+  call;
+  work;
+  control;
+  log;
+  reports;
+  roots = /* @__PURE__ */ new Map();
+  async warn(report, phase) {
+    const warning = phase === "restore" ? "Cache restore failed; continuing without this cache" : "Cache save failed; task result is unaffected";
+    report.warning = report.warning ? `${report.warning}; ${warning}` : warning;
+    await (0, import_promises7.appendFile)(
+      this.log,
+      `
+Nimbus cache ${report.index}: ${warning}
+`
+    ).catch(() => {
+    });
+  }
+  async restore() {
+    const signal = AbortSignal.timeout(12e4);
+    const all = [];
+    for (const [index, spec] of this.specs.entries()) {
+      try {
+        const roots = await cacheDirectories(
+          spec.paths,
+          this.work,
+          this.control
+        );
+        this.roots.set(index, roots);
+        all.push(...roots.map((path) => ({ index, path })));
+      } catch {
+        this.reports[index].restore = "error";
+        await this.warn(this.reports[index], "restore");
+      }
+    }
+    for (const a of all)
+      if (all.some(
+        (b2) => a.index !== b2.index && (a.path.toLowerCase() === b2.path.toLowerCase() || a.path.toLowerCase().startsWith(b2.path.toLowerCase() + import_node_path13.sep) || b2.path.toLowerCase().startsWith(a.path.toLowerCase() + import_node_path13.sep))
+      )) {
+        this.roots.delete(a.index);
+        if (this.reports[a.index].restore !== "error") {
+          this.reports[a.index].restore = "error";
+          await this.warn(this.reports[a.index], "restore");
+        }
+      }
+    for (const report of this.reports) {
+      const roots = this.roots.get(report.index);
+      if (!roots) continue;
+      const started = Date.now();
+      const archive = (0, import_node_path13.join)(
+        this.control,
+        `cache-restore-${report.index}.tar.zst`
+      );
+      try {
+        signal.throwIfAborted();
+        const hit = await this.call(
+          `caches/${report.index}/restore`,
+          "POST",
+          {},
+          signal
+        );
+        if (!hit.transfer) continue;
+        if (!hit.matchedKey || hit.size === void 0 || hit.size > MAX_UPLOAD_BYTES || hit.size < 0 || !hit.md5)
+          throw new Error("Invalid cache response");
+        const response = await fetch(hit.transfer.url, {
+          headers: hit.transfer.headers,
+          redirect: "error",
+          signal
+        });
+        if (!response.ok || !response.body)
+          throw new Error("Cache download failed");
+        await (0, import_promises8.pipeline)(
+          import_node_stream3.Readable.fromWeb(response.body),
+          byteLimit(hit.size),
+          (0, import_node_fs9.createWriteStream)(archive, { flags: "wx" }),
+          { signal }
+        );
+        if ((await (0, import_promises7.stat)(archive)).size !== hit.size || await cacheChecksum(archive, signal) !== hit.md5)
+          throw new Error("Cache checksum mismatch");
+        await unpackCache(archive, roots, this.control, signal);
+        report.matchedKey = hit.matchedKey;
+        report.restore = hit.matchedKey === report.key ? "exact" : "prefix";
+        report.size = hit.size;
+      } catch {
+        report.restore = "error";
+        await this.warn(report, "restore");
+      } finally {
+        report.restoreMs = Date.now() - started;
+        await (0, import_promises7.rm)(archive, { force: true }).catch(() => {
+        });
+      }
+    }
+  }
+  async save() {
+    const signal = AbortSignal.timeout(12e4);
+    for (const report of this.reports) {
+      if (report.restore === "exact" || !this.roots.has(report.index)) continue;
+      const started = Date.now();
+      const archive = (0, import_node_path13.join)(this.control, `cache-save-${report.index}.tar.zst`);
+      try {
+        signal.throwIfAborted();
+        const roots = await cacheDirectories(
+          this.specs[report.index].paths,
+          this.work,
+          this.control
+        );
+        if (JSON.stringify(roots) !== JSON.stringify(this.roots.get(report.index)))
+          throw new Error("Cache locations changed");
+        if (!await packCache(roots, archive, this.control, signal)) continue;
+        const size = (await (0, import_promises7.stat)(archive)).size;
+        const md5 = await cacheChecksum(archive, signal);
+        signal.throwIfAborted();
+        const transfer = await this.call(`caches/${report.index}/save`, "POST", { size, md5 }, signal);
+        if ("skipped" in transfer) continue;
+        const response = await fetch(transfer.url, {
+          method: "PUT",
+          headers: { ...transfer.headers, "Content-Length": String(size) },
+          body: import_node_stream3.Readable.toWeb(
+            (0, import_node_fs9.createReadStream)(archive)
+          ),
+          duplex: "half",
+          redirect: "error",
+          signal
+        });
+        if (!response.ok) throw new Error("Cache upload failed");
+        await this.call(
+          `caches/${report.index}/complete`,
+          "POST",
+          {
+            id: transfer.id
+          },
+          signal
+        );
+        report.save = "pending";
+        report.size = size;
+      } catch {
+        report.save = "error";
+        await this.warn(report, "save");
+      } finally {
+        report.saveMs = Date.now() - started;
+        await (0, import_promises7.rm)(archive, { force: true }).catch(() => {
+        });
+      }
+    }
+  }
+};
+
 // src/main.ts
 async function checksum(file2) {
-  const hash2 = (0, import_node_crypto2.createHash)("md5");
-  for await (const chunk of (0, import_node_fs8.createReadStream)(file2)) hash2.update(chunk);
+  const hash2 = (0, import_node_crypto3.createHash)("md5");
+  for await (const chunk of (0, import_node_fs10.createReadStream)(file2)) hash2.update(chunk);
   return hash2.digest("base64");
 }
 async function main() {
   if (!process.env.GITHUB_EVENT_PATH) throw new Error("Workflow event missing");
   const event = JSON.parse(
-    await (0, import_promises5.readFile)(process.env.GITHUB_EVENT_PATH, "utf8")
+    await (0, import_promises9.readFile)(process.env.GITHUB_EVENT_PATH, "utf8")
   );
   const { task_id: id, task_token: token, api_url: api } = event.inputs;
   if (!/^[0-9a-f-]{36}$/.test(id) || !/^[0-9a-f]{64}$/.test(token))
@@ -23081,7 +23548,7 @@ async function main() {
     throw new Error("Invalid API origin");
   process.stdout.write(`::add-mask::${token}
 `);
-  const call = async (path, method = "GET", body) => {
+  const call = async (path, method = "GET", body, signal) => {
     const response = await fetch(
       `${base.origin}/internal/tasks/${id}/${path}`,
       {
@@ -23091,7 +23558,7 @@ async function main() {
           "Content-Type": "application/json"
         },
         body: body === void 0 ? void 0 : JSON.stringify(body),
-        signal: AbortSignal.timeout(3e4),
+        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(3e4)]) : AbortSignal.timeout(3e4),
         redirect: "error"
       }
     );
@@ -23103,15 +23570,16 @@ async function main() {
   };
   const runId = Number(process.env.GITHUB_RUN_ID);
   const payload = await call("claim", "POST", { runId });
-  const root = await (0, import_promises5.mkdtemp)((0, import_node_path12.join)((0, import_node_os.tmpdir)(), "nimbus-"));
-  const control = (0, import_node_path12.join)(root, "control");
-  const work = (0, import_node_path12.join)(root, "work");
-  const log = (0, import_node_path12.join)(control, "run.log");
-  await (0, import_promises5.mkdir)(control, { mode: 448 });
-  await (0, import_promises5.mkdir)((0, import_node_path12.join)(work, "inputs"), { recursive: true });
-  await (0, import_promises5.mkdir)((0, import_node_path12.join)(work, "out"));
-  await (0, import_promises5.writeFile)(log, "", { mode: 384 });
+  const root = await (0, import_promises9.mkdtemp)((0, import_node_path14.join)((0, import_node_os2.tmpdir)(), "nimbus-"));
+  const control = (0, import_node_path14.join)(root, "control");
+  const work = (0, import_node_path14.join)(root, "work");
+  const log = (0, import_node_path14.join)(control, "run.log");
+  await (0, import_promises9.mkdir)(control, { mode: 448 });
+  await (0, import_promises9.mkdir)((0, import_node_path14.join)(work, "inputs"), { recursive: true });
+  await (0, import_promises9.mkdir)((0, import_node_path14.join)(work, "out"));
+  await (0, import_promises9.writeFile)(log, "", { mode: 384 });
   const result = { exitCode: null };
+  const cache = new TaskCache(payload.caches ?? [], call, work, control, log);
   try {
     try {
       for (const input2 of payload.files) {
@@ -23123,27 +23591,29 @@ async function main() {
         });
         if (!response.ok || !response.body)
           throw new Error("Input file missing or download failed");
-        const archive = (0, import_node_path12.join)(control, `${input2.id}-${crypto.randomUUID()}`);
-        await (0, import_promises6.pipeline)(
-          import_node_stream2.Readable.fromWeb(response.body),
-          (0, import_node_fs8.createWriteStream)(archive, { flags: "wx" })
+        const archive = (0, import_node_path14.join)(control, `${input2.id}-${crypto.randomUUID()}`);
+        await (0, import_promises10.pipeline)(
+          import_node_stream4.Readable.fromWeb(response.body),
+          (0, import_node_fs10.createWriteStream)(archive, { flags: "wx" })
         );
-        if ((await (0, import_promises5.stat)(archive)).size !== input2.size || await checksum(archive) !== input2.md5)
+        if ((await (0, import_promises9.stat)(archive)).size !== input2.size || await checksum(archive) !== input2.md5)
           throw new Error("Input integrity check failed");
-        const target = (0, import_node_path12.resolve)(work, "inputs", input2.target);
+        const target = (0, import_node_path14.resolve)(work, "inputs", input2.target);
         if (input2.kind === "artifact") {
-          const extract = (0, import_node_path12.join)(control, `extract-${crypto.randomUUID()}`);
+          const extract = (0, import_node_path14.join)(control, `extract-${crypto.randomUUID()}`);
           await unpack(archive, extract, input2.entries);
           await selectInput(extract, input2.sourcePath, target);
         } else {
-          await (0, import_promises5.mkdir)((0, import_node_path12.dirname)(target), { recursive: true });
+          await (0, import_promises9.mkdir)((0, import_node_path14.dirname)(target), { recursive: true });
           await selectInput(
-            (0, import_node_path12.dirname)(archive),
+            (0, import_node_path14.dirname)(archive),
             archive.split(/[\\/]/).at(-1),
             target
           );
         }
       }
+      if (payload.caches?.length) result.caches = cache.reports;
+      await cache.restore();
       result.exitCode = await runScript(
         payload,
         payload.pat,
@@ -23155,7 +23625,7 @@ async function main() {
         result.error = `Script exited with code ${result.exitCode}`;
     } catch (error62) {
       result.error = error62 instanceof Error ? error62.message : "Execution preparation failed";
-      await (0, import_promises5.appendFile)(log, `
+      await (0, import_promises9.appendFile)(log, `
 Nimbus: ${result.error}
 `);
     }
@@ -23163,7 +23633,7 @@ Nimbus: ${result.error}
       result.error ??= "Could not report upload phase";
     });
     const upload = async (file2, kind, entries = []) => {
-      const size = (await (0, import_promises5.stat)(file2)).size;
+      const size = (await (0, import_promises9.stat)(file2)).size;
       if (size > MAX_UPLOAD_BYTES)
         throw new Error(`${kind} exceeds single-upload limit`);
       const transfer = await call(
@@ -23180,8 +23650,8 @@ Nimbus: ${result.error}
       const response = await fetch(transfer.url, {
         method: "PUT",
         headers: { ...transfer.headers, "Content-Length": String(size) },
-        body: import_node_stream2.Readable.toWeb(
-          (0, import_node_fs8.createReadStream)(file2)
+        body: import_node_stream4.Readable.toWeb(
+          (0, import_node_fs10.createReadStream)(file2)
         ),
         duplex: "half",
         redirect: "error",
@@ -23193,19 +23663,20 @@ Nimbus: ${result.error}
       return transfer.id;
     };
     try {
-      const archive = (0, import_node_path12.join)(control, "out.tar.zst");
-      const entries = await pack((0, import_node_path12.join)(work, "out"), archive);
+      const archive = (0, import_node_path14.join)(control, "out.tar.zst");
+      const entries = await pack((0, import_node_path14.join)(work, "out"), archive);
       result.artifactId = await upload(archive, "artifact", entries);
     } catch {
       result.error = [result.error, "Artifact collection or upload failed"].filter(Boolean).join("; ");
-      await (0, import_promises5.appendFile)(log, "\nNimbus: Artifact collection or upload failed\n");
+      await (0, import_promises9.appendFile)(log, "\nNimbus: Artifact collection or upload failed\n");
     }
+    if (result.exitCode === 0 && !result.error) await cache.save();
     try {
-      const compressed = (0, import_node_path12.join)(control, "log.zst");
-      await (0, import_promises6.pipeline)(
-        (0, import_node_fs8.createReadStream)(log),
-        (0, import_node_zlib2.createZstdCompress)(),
-        (0, import_node_fs8.createWriteStream)(compressed, { flags: "wx" })
+      const compressed = (0, import_node_path14.join)(control, "log.zst");
+      await (0, import_promises10.pipeline)(
+        (0, import_node_fs10.createReadStream)(log),
+        (0, import_node_zlib3.createZstdCompress)(),
+        (0, import_node_fs10.createWriteStream)(compressed, { flags: "wx" })
       );
       result.logId = await upload(compressed, "log");
     } catch {
@@ -23214,7 +23685,7 @@ Nimbus: ${result.error}
     await call("result", "POST", result);
     if (result.error || result.exitCode !== 0) process.exitCode = 1;
   } finally {
-    await (0, import_promises5.rm)(root, { recursive: true, force: true });
+    await (0, import_promises9.rm)(root, { recursive: true, force: true });
   }
 }
 main().catch(() => {
