@@ -23119,6 +23119,9 @@ var import_node_zlib2 = require("node:zlib");
 var inside = (root, path) => path === root || path.startsWith(root + import_node_path12.sep);
 var overlaps = (a, b2) => inside(a, b2) || inside(b2, a);
 var absent = (error62) => error62.code === "ENOENT";
+function safeCachePath(path, platform = process.platform) {
+  return safePath(platform === "win32" ? path : path.replaceAll(":", "_"));
+}
 async function canonical(path) {
   try {
     return await (0, import_promises5.realpath)(path);
@@ -23188,7 +23191,7 @@ async function packCache(roots, archive, control, signal) {
     if (info.isDirectory()) {
       await (0, import_promises5.mkdir)(dest);
       for (const name of (await (0, import_promises5.readdir)(source)).sort()) {
-        if (!safePath(name)) throw new Error("Unsupported cache filename");
+        if (!safeCachePath(name)) throw new Error("Unsupported cache filename");
         await copy((0, import_node_path12.join)(source, name), (0, import_node_path12.join)(dest, name), root);
       }
     } else if (info.isFile()) {
@@ -23243,7 +23246,7 @@ async function unpackCache(archive, roots, control, signal) {
         const path = entry.path.replace(/\/$/, "");
         const root = path.split("/")[0];
         bytes += entry.size;
-        if (!safePath(path) || !/^(0|[1-9]\d*)$/.test(root) || Number(root) >= roots.length || lower.has(path.toLowerCase()) || entries.size >= MAX_CACHE_ENTRIES || bytes > MAX_CACHE_EXPANDED_BYTES || !["File", "Directory", "SymbolicLink"].includes(entry.type) || path === root && entry.type !== "Directory") {
+        if (!safeCachePath(path) || !/^(0|[1-9]\d*)$/.test(root) || Number(root) >= roots.length || lower.has(path.toLowerCase()) || entries.size >= MAX_CACHE_ENTRIES || bytes > MAX_CACHE_EXPANDED_BYTES || !["File", "Directory", "SymbolicLink"].includes(entry.type) || path === root && entry.type !== "Directory") {
           invalid = true;
           return;
         }
@@ -23251,7 +23254,7 @@ async function unpackCache(archive, roots, control, signal) {
         if (entry.type === "SymbolicLink") {
           link = entry.linkpath ?? "";
           const target = import_node_path12.posix.normalize(import_node_path12.posix.join(import_node_path12.posix.dirname(path), link));
-          if (!link || /[\\:\x00-\x1f\x7f]/.test(link) || import_node_path12.posix.isAbsolute(link) || !(target === root || target.startsWith(root + "/")))
+          if (!link || /[\\\x00-\x1f\x7f]/.test(link) || process.platform === "win32" && link.includes(":") || import_node_path12.posix.isAbsolute(link) || !(target === root || target.startsWith(root + "/")))
             invalid = true;
         }
         lower.add(path.toLowerCase());
@@ -23368,6 +23371,48 @@ async function cacheChecksum(file2, signal) {
     hash2.update(chunk);
   return hash2.digest("base64");
 }
+function cacheFailureReason(error62) {
+  if (!(error62 instanceof Error)) return "unknown error";
+  if (["AbortError", "TimeoutError"].includes(error62.name))
+    return "time budget exceeded";
+  const code = error62.code;
+  if (code && [
+    "ENOSPC",
+    "EACCES",
+    "EPERM",
+    "ENOENT",
+    "ELOOP",
+    "EIO",
+    "EMFILE",
+    "ENFILE",
+    "ECONNRESET",
+    "ETIMEDOUT",
+    "ENOTDIR"
+  ].includes(code))
+    return code;
+  const known = [
+    "Unsupported cache filename",
+    "Cache link escapes its directory",
+    "Special cache files are unsupported",
+    "Cache exceeds entry limit",
+    "Cache exceeds expanded size limit",
+    "Cache exceeds size limit",
+    "Cache directory changed",
+    "Cache locations changed",
+    "Cache root must be a directory, not a link",
+    "Cache directories overlap protected paths or each other",
+    "Invalid cache archive",
+    "Cache checksum mismatch",
+    "Cache download failed",
+    "Invalid cache response"
+  ];
+  if (known.includes(error62.message)) return error62.message;
+  const http = error62.message.match(
+    /^(?:Nimbus caches failed|Cache upload failed) \(HTTP (\d{3})\)$/
+  );
+  if (http) return `HTTP ${http[1]}`;
+  return "operation failed";
+}
 var TaskCache = class {
   constructor(specs, call, work, control, log) {
     this.specs = specs;
@@ -23389,13 +23434,14 @@ var TaskCache = class {
   log;
   reports;
   roots = /* @__PURE__ */ new Map();
-  async warn(report, phase) {
+  async warn(report, phase, stage = "paths", error62) {
     const warning = phase === "restore" ? "Cache restore failed; continuing without this cache" : "Cache save failed; task result is unaffected";
-    report.warning = report.warning ? `${report.warning}; ${warning}` : warning;
+    const detail = `${warning} (${stage}: ${cacheFailureReason(error62)})`;
+    report.warning = report.warning ? `${report.warning}; ${detail}` : detail;
     await (0, import_promises7.appendFile)(
       this.log,
       `
-Nimbus cache ${report.index}: ${warning}
+Nimbus cache ${report.index}: ${detail}
 `
     ).catch(() => {
     });
@@ -23412,9 +23458,9 @@ Nimbus cache ${report.index}: ${warning}
         );
         this.roots.set(index, roots);
         all.push(...roots.map((path) => ({ index, path })));
-      } catch {
+      } catch (error62) {
         this.reports[index].restore = "error";
-        await this.warn(this.reports[index], "restore");
+        await this.warn(this.reports[index], "restore", "paths", error62);
       }
     }
     for (const a of all)
@@ -23435,6 +23481,7 @@ Nimbus cache ${report.index}: ${warning}
         this.control,
         `cache-restore-${report.index}.tar.zst`
       );
+      let stage = "lookup";
       try {
         signal.throwIfAborted();
         const hit = await this.call(
@@ -23446,6 +23493,7 @@ Nimbus cache ${report.index}: ${warning}
         if (!hit.transfer) continue;
         if (!hit.matchedKey || hit.size === void 0 || hit.size > MAX_UPLOAD_BYTES || hit.size < 0 || !hit.md5)
           throw new Error("Invalid cache response");
+        stage = "download";
         const response = await fetch(hit.transfer.url, {
           headers: hit.transfer.headers,
           redirect: "error",
@@ -23459,8 +23507,10 @@ Nimbus cache ${report.index}: ${warning}
           (0, import_node_fs9.createWriteStream)(archive, { flags: "wx" }),
           { signal }
         );
+        stage = "checksum";
         if ((await (0, import_promises7.stat)(archive)).size !== hit.size || await cacheChecksum(archive, signal) !== hit.md5)
           throw new Error("Cache checksum mismatch");
+        stage = "extract";
         await unpackCache(archive, roots, this.control, signal);
         report.matchedKey = hit.matchedKey;
         report.restore = hit.matchedKey === report.key ? "exact" : "prefix";
@@ -23484,9 +23534,9 @@ Nimbus cache ${report.index}: ${report.warning}
             });
           }
         }
-      } catch {
+      } catch (error62) {
         report.restore = "error";
-        await this.warn(report, "restore");
+        await this.warn(report, "restore", stage, error62);
       } finally {
         report.restoreMs = Date.now() - started;
         await (0, import_promises7.rm)(archive, { force: true }).catch(() => {
@@ -23500,6 +23550,7 @@ Nimbus cache ${report.index}: ${report.warning}
       if (report.restore === "exact" || !this.roots.has(report.index)) continue;
       const started = Date.now();
       const archive = (0, import_node_path13.join)(this.control, `cache-save-${report.index}.tar.zst`);
+      let stage = "paths";
       try {
         signal.throwIfAborted();
         const roots = await cacheDirectories(
@@ -23509,12 +23560,16 @@ Nimbus cache ${report.index}: ${report.warning}
         );
         if (JSON.stringify(roots) !== JSON.stringify(this.roots.get(report.index)))
           throw new Error("Cache locations changed");
+        stage = "archive";
         if (!await packCache(roots, archive, this.control, signal)) continue;
+        stage = "checksum";
         const size = (await (0, import_promises7.stat)(archive)).size;
         const md5 = await cacheChecksum(archive, signal);
         signal.throwIfAborted();
+        stage = "authorize";
         const transfer = await this.call(`caches/${report.index}/save`, "POST", { size, md5 }, signal);
         if ("skipped" in transfer) continue;
+        stage = "upload";
         const response = await fetch(transfer.url, {
           method: "PUT",
           headers: { ...transfer.headers, "Content-Length": String(size) },
@@ -23525,7 +23580,9 @@ Nimbus cache ${report.index}: ${report.warning}
           redirect: "error",
           signal
         });
-        if (!response.ok) throw new Error("Cache upload failed");
+        if (!response.ok)
+          throw new Error(`Cache upload failed (HTTP ${response.status})`);
+        stage = "confirm";
         await this.call(
           `caches/${report.index}/complete`,
           "POST",
@@ -23536,9 +23593,9 @@ Nimbus cache ${report.index}: ${report.warning}
         );
         report.save = "pending";
         report.size = size;
-      } catch {
+      } catch (error62) {
         report.save = "error";
-        await this.warn(report, "save");
+        await this.warn(report, "save", stage, error62);
       } finally {
         report.saveMs = Date.now() - started;
         await (0, import_promises7.rm)(archive, { force: true }).catch(() => {
