@@ -19818,7 +19818,8 @@ var cachePathSchema = external_exports.string().min(1).max(500).transform((path)
 var cacheSchema = external_exports.object({
   key: cacheKeySchema,
   paths: external_exports.array(cachePathSchema).min(1).max(10),
-  restoreKeys: external_exports.array(cacheKeySchema).max(10).default([])
+  restoreKeys: external_exports.array(cacheKeySchema).max(10).default([]),
+  saveAlways: external_exports.boolean().optional()
 }).strict();
 var cacheReportSchema = external_exports.object({
   index: external_exports.number().int().min(0).max(9),
@@ -23534,8 +23535,9 @@ Nimbus cache ${report.index}: ${report.warning}
       }
     }
   }
-  async save() {
+  async save(successful = true) {
     for (const report of this.reports) {
+      if (!successful && !this.specs[report.index].saveAlways) continue;
       if (report.restore === "exact" || !this.roots.has(report.index)) continue;
       const started = Date.now();
       const archive = (0, import_node_path13.join)(this.control, `cache-save-${report.index}.tar.zst`);
@@ -23731,7 +23733,7 @@ Nimbus: ${result.error}
       result.error = [result.error, "Artifact collection or upload failed"].filter(Boolean).join("; ");
       await (0, import_promises9.appendFile)(log, "\nNimbus: Artifact collection or upload failed\n");
     }
-    if (result.exitCode === 0 && !result.error) await cache.save();
+    await cache.save(result.exitCode === 0 && !result.error);
     try {
       const compressed = (0, import_node_path14.join)(control, "log.zst");
       await (0, import_promises10.pipeline)(
