@@ -23465,6 +23465,25 @@ Nimbus cache ${report.index}: ${warning}
         report.matchedKey = hit.matchedKey;
         report.restore = hit.matchedKey === report.key ? "exact" : "prefix";
         report.size = hit.size;
+        if (hit.id) {
+          try {
+            await this.call(
+              `caches/${report.index}/restored`,
+              "POST",
+              { id: hit.id },
+              signal
+            );
+          } catch {
+            report.warning = "Cache restored, but usage confirmation failed; retention was not renewed";
+            await (0, import_promises7.appendFile)(
+              this.log,
+              `
+Nimbus cache ${report.index}: ${report.warning}
+`
+            ).catch(() => {
+            });
+          }
+        }
       } catch {
         report.restore = "error";
         await this.warn(report, "restore");
