@@ -23173,7 +23173,7 @@ async function packCache(roots, archive, control, signal) {
   let bytes = 0;
   const names = [];
   async function copy(source, dest, root) {
-    signal.throwIfAborted();
+    signal?.throwIfAborted();
     if (++count > MAX_CACHE_ENTRIES)
       throw new Error("Cache exceeds entry limit");
     const info = await (0, import_promises5.lstat)(source);
@@ -23205,7 +23205,7 @@ async function packCache(roots, archive, control, signal) {
   }
   try {
     for (const [i, root] of roots.entries()) {
-      signal.throwIfAborted();
+      signal?.throwIfAborted();
       const info = await (0, import_promises5.lstat)(root).catch((error62) => {
         if (!absent(error62)) throw error62;
       });
@@ -23296,7 +23296,7 @@ async function unpackCache(archive, roots, control, signal) {
       { signal }
     );
     for (const entry of entries.values()) {
-      signal.throwIfAborted();
+      signal?.throwIfAborted();
       if (entry.link)
         await (0, import_promises5.symlink)(
           entry.link,
@@ -23316,7 +23316,7 @@ async function unpackCache(archive, roots, control, signal) {
     }
     for (const [i, target] of roots.entries()) {
       if (!entries.has(String(i))) continue;
-      signal.throwIfAborted();
+      signal?.throwIfAborted();
       if (await canonical(target) !== target)
         throw new Error("Cache target changed");
       await (0, import_promises5.mkdir)((0, import_node_path12.dirname)(target), { recursive: true });
@@ -23330,7 +23330,7 @@ async function unpackCache(archive, roots, control, signal) {
       });
     }
     for (const item of prepared) {
-      signal.throwIfAborted();
+      signal?.throwIfAborted();
       if (await canonical(item.target) !== item.target)
         throw new Error("Cache target changed");
       try {
@@ -23365,16 +23365,15 @@ async function unpackCache(archive, roots, control, signal) {
 }
 
 // src/cache.ts
-async function cacheChecksum(file2, signal) {
+async function cacheChecksum(file2) {
   const hash2 = (0, import_node_crypto2.createHash)("md5");
-  for await (const chunk of (0, import_node_fs9.createReadStream)(file2, { signal }))
-    hash2.update(chunk);
+  for await (const chunk of (0, import_node_fs9.createReadStream)(file2)) hash2.update(chunk);
   return hash2.digest("base64");
 }
 function cacheFailureReason(error62) {
   if (!(error62 instanceof Error)) return "unknown error";
   if (["AbortError", "TimeoutError"].includes(error62.name))
-    return "time budget exceeded";
+    return "request timed out";
   const code = error62.code;
   if (code && [
     "ENOSPC",
@@ -23447,7 +23446,6 @@ Nimbus cache ${report.index}: ${detail}
     });
   }
   async restore() {
-    const signal = AbortSignal.timeout(12e4);
     const all = [];
     for (const [index, spec] of this.specs.entries()) {
       try {
@@ -23483,12 +23481,10 @@ Nimbus cache ${report.index}: ${detail}
       );
       let stage = "lookup";
       try {
-        signal.throwIfAborted();
         const hit = await this.call(
           `caches/${report.index}/restore`,
           "POST",
-          {},
-          signal
+          {}
         );
         if (!hit.transfer) continue;
         if (!hit.matchedKey || hit.size === void 0 || hit.size > MAX_UPLOAD_BYTES || hit.size < 0 || !hit.md5)
@@ -23496,33 +23492,28 @@ Nimbus cache ${report.index}: ${detail}
         stage = "download";
         const response = await fetch(hit.transfer.url, {
           headers: hit.transfer.headers,
-          redirect: "error",
-          signal
+          redirect: "error"
         });
         if (!response.ok || !response.body)
           throw new Error("Cache download failed");
         await (0, import_promises8.pipeline)(
           import_node_stream3.Readable.fromWeb(response.body),
           byteLimit(hit.size),
-          (0, import_node_fs9.createWriteStream)(archive, { flags: "wx" }),
-          { signal }
+          (0, import_node_fs9.createWriteStream)(archive, { flags: "wx" })
         );
         stage = "checksum";
-        if ((await (0, import_promises7.stat)(archive)).size !== hit.size || await cacheChecksum(archive, signal) !== hit.md5)
+        if ((await (0, import_promises7.stat)(archive)).size !== hit.size || await cacheChecksum(archive) !== hit.md5)
           throw new Error("Cache checksum mismatch");
         stage = "extract";
-        await unpackCache(archive, roots, this.control, signal);
+        await unpackCache(archive, roots, this.control);
         report.matchedKey = hit.matchedKey;
         report.restore = hit.matchedKey === report.key ? "exact" : "prefix";
         report.size = hit.size;
         if (hit.id) {
           try {
-            await this.call(
-              `caches/${report.index}/restored`,
-              "POST",
-              { id: hit.id },
-              signal
-            );
+            await this.call(`caches/${report.index}/restored`, "POST", {
+              id: hit.id
+            });
           } catch {
             report.warning = "Cache restored, but usage confirmation failed; retention was not renewed";
             await (0, import_promises7.appendFile)(
@@ -23545,14 +23536,12 @@ Nimbus cache ${report.index}: ${report.warning}
     }
   }
   async save() {
-    const signal = AbortSignal.timeout(12e4);
     for (const report of this.reports) {
       if (report.restore === "exact" || !this.roots.has(report.index)) continue;
       const started = Date.now();
       const archive = (0, import_node_path13.join)(this.control, `cache-save-${report.index}.tar.zst`);
       let stage = "paths";
       try {
-        signal.throwIfAborted();
         const roots = await cacheDirectories(
           this.specs[report.index].paths,
           this.work,
@@ -23561,13 +23550,12 @@ Nimbus cache ${report.index}: ${report.warning}
         if (JSON.stringify(roots) !== JSON.stringify(this.roots.get(report.index)))
           throw new Error("Cache locations changed");
         stage = "archive";
-        if (!await packCache(roots, archive, this.control, signal)) continue;
+        if (!await packCache(roots, archive, this.control)) continue;
         stage = "checksum";
         const size = (await (0, import_promises7.stat)(archive)).size;
-        const md5 = await cacheChecksum(archive, signal);
-        signal.throwIfAborted();
+        const md5 = await cacheChecksum(archive);
         stage = "authorize";
-        const transfer = await this.call(`caches/${report.index}/save`, "POST", { size, md5 }, signal);
+        const transfer = await this.call(`caches/${report.index}/save`, "POST", { size, md5 });
         if ("skipped" in transfer) continue;
         stage = "upload";
         const response = await fetch(transfer.url, {
@@ -23577,20 +23565,14 @@ Nimbus cache ${report.index}: ${report.warning}
             (0, import_node_fs9.createReadStream)(archive)
           ),
           duplex: "half",
-          redirect: "error",
-          signal
+          redirect: "error"
         });
         if (!response.ok)
           throw new Error(`Cache upload failed (HTTP ${response.status})`);
         stage = "confirm";
-        await this.call(
-          `caches/${report.index}/complete`,
-          "POST",
-          {
-            id: transfer.id
-          },
-          signal
-        );
+        await this.call(`caches/${report.index}/complete`, "POST", {
+          id: transfer.id
+        });
         report.save = "pending";
         report.size = size;
       } catch (error62) {
@@ -23624,7 +23606,7 @@ async function main() {
     throw new Error("Invalid API origin");
   process.stdout.write(`::add-mask::${token}
 `);
-  const call = async (path, method = "GET", body, signal) => {
+  const call = async (path, method = "GET", body) => {
     const response = await fetch(
       `${base.origin}/internal/tasks/${id}/${path}`,
       {
@@ -23634,7 +23616,8 @@ async function main() {
           "Content-Type": "application/json"
         },
         body: body === void 0 ? void 0 : JSON.stringify(body),
-        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(3e4)]) : AbortSignal.timeout(3e4),
+        // Cache operations are governed only by the job timeout, including their API calls.
+        signal: path.startsWith("caches/") ? void 0 : AbortSignal.timeout(3e4),
         redirect: "error"
       }
     );
