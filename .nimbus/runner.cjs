@@ -35,7 +35,6 @@ __export(main_exports, {
 module.exports = __toCommonJS(main_exports);
 var import_node_fs10 = require("node:fs");
 var import_promises9 = require("node:fs/promises");
-var import_node_os2 = require("node:os");
 var import_node_path14 = require("node:path");
 var import_node_crypto3 = require("node:crypto");
 var import_promises10 = require("node:stream/promises");
@@ -23595,6 +23594,8 @@ async function checksum(file2) {
 }
 async function main() {
   if (!process.env.GITHUB_EVENT_PATH) throw new Error("Workflow event missing");
+  const workspace = process.env.GITHUB_WORKSPACE;
+  if (!workspace) throw new Error("Workflow workspace missing");
   const event = JSON.parse(
     await (0, import_promises9.readFile)(process.env.GITHUB_EVENT_PATH, "utf8")
   );
@@ -23629,7 +23630,8 @@ async function main() {
   };
   const runId = Number(process.env.GITHUB_RUN_ID);
   const payload = await call("claim", "POST", { runId });
-  const root = await (0, import_promises9.mkdtemp)((0, import_node_path14.join)((0, import_node_os2.tmpdir)(), "nimbus-"));
+  const root = (0, import_node_path14.join)(workspace, ".nimbus-task");
+  await (0, import_promises9.mkdir)(root, { mode: 448 });
   const control = (0, import_node_path14.join)(root, "control");
   const work = (0, import_node_path14.join)(root, "work");
   const log = (0, import_node_path14.join)(control, "run.log");
