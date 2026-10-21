@@ -1,0 +1,30 @@
+name: Nimbus relay
+run-name: Nimbus ${{ inputs.task_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      task_id: { required: true, type: string }
+      runner: { required: true, type: string }
+      timeout_minutes: { required: true, type: string }
+      api_url: { required: true, type: string }
+      task_token: { required: true, type: string }
+permissions:
+  contents: read
+jobs:
+  execute:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes) }}
+    steps:
+      - name: Load executor configuration
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Prepare Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24.18.0"
+          package-manager-cache: false
+      - name: Execute Nimbus task
+        shell: bash
+        run: node --disable-warning=ExperimentalWarning .nimbus/runner.cjs
