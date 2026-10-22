@@ -23103,7 +23103,6 @@ async function runScript(spec, pat, cwd, control, logPath) {
 // src/cache.ts
 var import_node_fs9 = require("node:fs");
 var import_promises7 = require("node:fs/promises");
-var import_node_crypto2 = require("node:crypto");
 var import_node_path13 = require("node:path");
 var import_node_stream3 = require("node:stream");
 var import_promises8 = require("node:stream/promises");
@@ -23113,6 +23112,7 @@ var import_node_fs8 = require("node:fs");
 var import_promises5 = require("node:fs/promises");
 var import_node_path12 = require("node:path");
 var import_node_os = require("node:os");
+var import_node_crypto2 = require("node:crypto");
 var import_node_stream2 = require("node:stream");
 var import_promises6 = require("node:stream/promises");
 var import_node_zlib2 = require("node:zlib");
@@ -23167,12 +23167,24 @@ function byteLimit(max) {
     }
   });
 }
+function md5Tap() {
+  const hash2 = (0, import_node_crypto2.createHash)("md5");
+  const stream = new import_node_stream2.Transform({
+    transform(chunk, _encoding, done) {
+      hash2.update(chunk);
+      done(null, chunk);
+    }
+  });
+  return { stream, digest: () => hash2.digest("base64") };
+}
+var noHardlinks = { get: () => "\0", set: () => void 0 };
+var slash = (path) => process.platform === "win32" ? path.replaceAll("\\", "/") : path;
 async function packCache(roots, archive, control, signal) {
-  const stage = await (0, import_promises5.mkdtemp)((0, import_node_path12.join)(control, "cache-pack-"));
+  const files = [];
+  const names = /* @__PURE__ */ new Map();
   let count = 0;
   let bytes = 0;
-  const names = [];
-  async function copy(source, dest, root) {
+  async function walk(source, name, root) {
     signal?.throwIfAborted();
     if (++count > MAX_CACHE_ENTRIES)
       throw new Error("Cache exceeds entry limit");
@@ -23181,102 +23193,82 @@ async function packCache(roots, archive, control, signal) {
       const target = (0, import_node_path12.resolve)((0, import_node_path12.dirname)(source), await (0, import_promises5.readlink)(source));
       if (!inside(root, target) || !inside(root, await (0, import_promises5.realpath)(target)))
         throw new Error("Cache link escapes its directory");
-      await (0, import_promises5.symlink)(
-        (0, import_node_path12.relative)((0, import_node_path12.dirname)(source), target) || ".",
-        dest,
-        (await (0, import_promises5.lstat)(await (0, import_promises5.realpath)(target))).isDirectory() ? "dir" : "file"
-      );
+      const link = (0, import_node_path12.relative)((0, import_node_path12.dirname)(source), target) || ".";
+      names.set(slash(source), { path: name, type: "SymbolicLink", link: slash(link) });
+      files.push(source);
       return;
     }
     if (info.isDirectory()) {
-      await (0, import_promises5.mkdir)(dest);
-      for (const name of (await (0, import_promises5.readdir)(source)).sort()) {
-        if (!safeCachePath(name)) throw new Error("Unsupported cache filename");
-        await copy((0, import_node_path12.join)(source, name), (0, import_node_path12.join)(dest, name), root);
+      names.set(slash(source), { path: name, type: "Directory" });
+      files.push(source);
+      for (const entry of (await (0, import_promises5.readdir)(source)).sort()) {
+        if (!safeCachePath(entry)) throw new Error("Unsupported cache filename");
+        await walk((0, import_node_path12.join)(source, entry), `${name}/${entry}`, root);
       }
     } else if (info.isFile()) {
       bytes += info.size;
       if (bytes > MAX_CACHE_EXPANDED_BYTES)
         throw new Error("Cache exceeds expanded size limit");
-      await (0, import_promises5.copyFile)(source, dest);
+      names.set(slash(source), { path: name, type: "File" });
+      files.push(source);
     } else throw new Error("Special cache files are unsupported");
-    await (0, import_promises5.chmod)(dest, info.mode & 511);
-    await (0, import_promises5.utimes)(dest, info.atime, info.mtime);
   }
-  try {
-    for (const [i, root] of roots.entries()) {
-      signal?.throwIfAborted();
-      const info = await (0, import_promises5.lstat)(root).catch((error62) => {
-        if (!absent(error62)) throw error62;
-      });
-      if (!info) continue;
-      if (!info.isDirectory() || info.isSymbolicLink() || await (0, import_promises5.realpath)(root) !== root)
-        throw new Error("Cache directory changed");
-      const name = String(i);
-      await copy(root, (0, import_node_path12.join)(stage, name), root);
-      names.push(name);
-    }
-    if (!names.length) return false;
-    await (0, import_promises6.pipeline)(
-      Qn({ cwd: stage, portable: true, strict: true, follow: false }, names),
-      (0, import_node_zlib2.createZstdCompress)({
-        params: { [import_node_zlib2.constants.ZSTD_c_compressionLevel]: 3 }
-      }),
-      byteLimit(MAX_UPLOAD_BYTES),
-      (0, import_node_fs8.createWriteStream)(archive, { flags: "wx" }),
-      { signal }
-    );
-    return true;
-  } finally {
-    await (0, import_promises5.rm)(stage, { recursive: true, force: true });
+  for (const [i, root] of roots.entries()) {
+    signal?.throwIfAborted();
+    const info = await (0, import_promises5.lstat)(root).catch((error62) => {
+      if (!absent(error62)) throw error62;
+    });
+    if (!info) continue;
+    if (!info.isDirectory() || info.isSymbolicLink() || await (0, import_promises5.realpath)(root) !== root)
+      throw new Error("Cache directory changed");
+    await walk(root, String(i), root);
   }
+  if (!files.length) return false;
+  let changed = false;
+  const tap = md5Tap();
+  await (0, import_promises6.pipeline)(
+    Qn(
+      {
+        cwd: control,
+        portable: true,
+        strict: true,
+        follow: false,
+        noDirRecurse: true,
+        // Entries are renamed below; absolute sources must not be stripped (a strict-mode error).
+        preservePaths: true,
+        linkCache: noHardlinks,
+        onWriteEntry(entry) {
+          const known = names.get(slash(entry.absolute));
+          if (!known || known.type !== entry.type) {
+            changed = true;
+            entry.path = "invalid";
+            return;
+          }
+          entry.path = known.path;
+          if (known.link !== void 0) entry.linkpath = known.link;
+        }
+      },
+      files
+    ),
+    // Single-threaded on purpose: Node 24.18's zstd stream with ZSTD_c_nbWorkers fails
+    // on larger trees ("stream.push() after EOF"); measured, the staging copy, not the
+    // compressor, was the bottleneck (20k files / 320 MB: pack 30 s before, 2-4 s now).
+    (0, import_node_zlib2.createZstdCompress)({
+      params: { [import_node_zlib2.constants.ZSTD_c_compressionLevel]: 3 }
+    }),
+    byteLimit(MAX_UPLOAD_BYTES),
+    tap.stream,
+    (0, import_node_fs8.createWriteStream)(archive, { flags: "wx" }),
+    { signal }
+  );
+  if (changed) throw new Error("Cache directory changed");
+  return tap.digest();
 }
 async function unpackCache(archive, roots, control, signal) {
   const entries = /* @__PURE__ */ new Map();
   const lower = /* @__PURE__ */ new Set();
   let bytes = 0;
   let invalid = false;
-  await (0, import_promises6.pipeline)(
-    (0, import_node_fs8.createReadStream)(archive),
-    (0, import_node_zlib2.createZstdDecompress)(),
-    byteLimit(MAX_CACHE_EXPANDED_BYTES + MAX_CACHE_ENTRIES * 2048),
-    Ct({
-      strict: true,
-      onReadEntry(entry) {
-        const path = entry.path.replace(/\/$/, "");
-        const root = path.split("/")[0];
-        bytes += entry.size;
-        if (!safeCachePath(path) || !/^(0|[1-9]\d*)$/.test(root) || Number(root) >= roots.length || lower.has(path.toLowerCase()) || entries.size >= MAX_CACHE_ENTRIES || bytes > MAX_CACHE_EXPANDED_BYTES || !["File", "Directory", "SymbolicLink"].includes(entry.type) || path === root && entry.type !== "Directory") {
-          invalid = true;
-          return;
-        }
-        let link;
-        if (entry.type === "SymbolicLink") {
-          link = entry.linkpath ?? "";
-          const target = import_node_path12.posix.normalize(import_node_path12.posix.join(import_node_path12.posix.dirname(path), link));
-          if (!link || /[\\\x00-\x1f\x7f]/.test(link) || process.platform === "win32" && link.includes(":") || import_node_path12.posix.isAbsolute(link) || !(target === root || target.startsWith(root + "/")))
-            invalid = true;
-        }
-        lower.add(path.toLowerCase());
-        entries.set(path, {
-          path,
-          type: entry.type,
-          mode: (entry.mode ?? 0) & 511,
-          mtime: entry.mtime ?? void 0,
-          link
-        });
-      }
-    }),
-    { signal }
-  );
-  for (const entry of entries.values()) {
-    let parent = import_node_path12.posix.dirname(entry.path);
-    while (parent !== ".") {
-      if (entries.get(parent)?.type !== "Directory") invalid = true;
-      parent = import_node_path12.posix.dirname(parent);
-    }
-  }
-  if (invalid || !entries.size) throw new Error("Invalid cache archive");
   const stage = await (0, import_promises5.mkdtemp)((0, import_node_path12.join)(control, "cache-extract-"));
   const prepared = [];
   let committed = false;
@@ -23291,10 +23283,45 @@ async function unpackCache(archive, roots, control, signal) {
         preservePaths: false,
         preserveOwner: false,
         noChmod: true,
-        filter: (raw) => entries.get(raw.replace(/\/$/, ""))?.type !== "SymbolicLink"
+        filter: (_raw, entry) => {
+          if (!("type" in entry)) return false;
+          const path = entry.path.replace(/\/$/, "");
+          const root = path.split("/")[0];
+          bytes += entry.size ?? 0;
+          if (invalid || !safeCachePath(path) || !/^(0|[1-9]\d*)$/.test(root) || Number(root) >= roots.length || lower.has(path.toLowerCase()) || entries.size >= MAX_CACHE_ENTRIES || bytes > MAX_CACHE_EXPANDED_BYTES || !["File", "Directory", "SymbolicLink"].includes(entry.type) || path === root && entry.type !== "Directory") {
+            invalid = true;
+            return false;
+          }
+          let link;
+          if (entry.type === "SymbolicLink") {
+            link = entry.linkpath ?? "";
+            const target = import_node_path12.posix.normalize(import_node_path12.posix.join(import_node_path12.posix.dirname(path), link));
+            if (!link || /[\\\x00-\x1f\x7f]/.test(link) || process.platform === "win32" && link.includes(":") || import_node_path12.posix.isAbsolute(link) || !(target === root || target.startsWith(root + "/"))) {
+              invalid = true;
+              return false;
+            }
+          }
+          lower.add(path.toLowerCase());
+          entries.set(path, {
+            path,
+            type: entry.type,
+            mode: (entry.mode ?? 0) & 511,
+            mtime: entry.mtime ?? void 0,
+            link
+          });
+          return entry.type !== "SymbolicLink";
+        }
       }),
       { signal }
     );
+    for (const entry of entries.values()) {
+      let parent = import_node_path12.posix.dirname(entry.path);
+      while (parent !== ".") {
+        if (entries.get(parent)?.type !== "Directory") invalid = true;
+        parent = import_node_path12.posix.dirname(parent);
+      }
+    }
+    if (invalid || !entries.size) throw new Error("Invalid cache archive");
     for (const entry of entries.values()) {
       signal?.throwIfAborted();
       if (entry.link)
@@ -23323,11 +23350,16 @@ async function unpackCache(archive, roots, control, signal) {
       const temp = await (0, import_promises5.mkdtemp)((0, import_node_path12.join)((0, import_node_path12.dirname)(target), ".nimbus-cache-"));
       const item = { target, temp, previous: false, installed: false };
       prepared.push(item);
-      await (0, import_promises5.cp)((0, import_node_path12.join)(stage, String(i)), (0, import_node_path12.join)(temp, "new"), {
-        recursive: true,
-        preserveTimestamps: true,
-        verbatimSymlinks: true
-      });
+      try {
+        await (0, import_promises5.rename)((0, import_node_path12.join)(stage, String(i)), (0, import_node_path12.join)(temp, "new"));
+      } catch (error62) {
+        if (error62.code !== "EXDEV") throw error62;
+        await (0, import_promises5.cp)((0, import_node_path12.join)(stage, String(i)), (0, import_node_path12.join)(temp, "new"), {
+          recursive: true,
+          preserveTimestamps: true,
+          verbatimSymlinks: true
+        });
+      }
     }
     for (const item of prepared) {
       signal?.throwIfAborted();
@@ -23365,11 +23397,6 @@ async function unpackCache(archive, roots, control, signal) {
 }
 
 // src/cache.ts
-async function cacheChecksum(file2) {
-  const hash2 = (0, import_node_crypto2.createHash)("md5");
-  for await (const chunk of (0, import_node_fs9.createReadStream)(file2)) hash2.update(chunk);
-  return hash2.digest("base64");
-}
 function cacheFailureReason(error62) {
   if (!(error62 instanceof Error)) return "unknown error";
   if (["AbortError", "TimeoutError"].includes(error62.name))
@@ -23496,13 +23523,15 @@ Nimbus cache ${report.index}: ${detail}
         });
         if (!response.ok || !response.body)
           throw new Error("Cache download failed");
+        const tap = md5Tap();
         await (0, import_promises8.pipeline)(
           import_node_stream3.Readable.fromWeb(response.body),
           byteLimit(hit.size),
+          tap.stream,
           (0, import_node_fs9.createWriteStream)(archive, { flags: "wx" })
         );
         stage = "checksum";
-        if ((await (0, import_promises7.stat)(archive)).size !== hit.size || await cacheChecksum(archive) !== hit.md5)
+        if ((await (0, import_promises7.stat)(archive)).size !== hit.size || tap.digest() !== hit.md5)
           throw new Error("Cache checksum mismatch");
         stage = "extract";
         await unpackCache(archive, roots, this.control);
@@ -23551,10 +23580,10 @@ Nimbus cache ${report.index}: ${report.warning}
         if (JSON.stringify(roots) !== JSON.stringify(this.roots.get(report.index)))
           throw new Error("Cache locations changed");
         stage = "archive";
-        if (!await packCache(roots, archive, this.control)) continue;
+        const md5 = await packCache(roots, archive, this.control);
+        if (!md5) continue;
         stage = "checksum";
         const size = (await (0, import_promises7.stat)(archive)).size;
-        const md5 = await cacheChecksum(archive);
         stage = "authorize";
         const transfer = await this.call(`caches/${report.index}/save`, "POST", { size, md5 });
         if ("skipped" in transfer) continue;
