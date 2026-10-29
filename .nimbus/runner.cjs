@@ -19885,7 +19885,7 @@ var taskSchema = external_exports.object({
     });
 });
 var createTaskSchema = taskSchema.safeExtend({
-  pat: external_exports.string().min(1).max(2e3)
+  pat: external_exports.string().min(1).max(2e3).optional()
 });
 var entrySchema = external_exports.object({
   path: relativePath,
@@ -23037,10 +23037,10 @@ var import_node_child_process = require("node:child_process");
 var import_node_path11 = require("node:path");
 var helperSource = `const fs=require('node:fs');
 const fields=Object.fromEntries(fs.readFileSync(0,'utf8').trim().split('\\n').map(l=>{const p=l.indexOf('=');return [l.slice(0,p),l.slice(p+1)]}));
-if(process.argv[2]==='get' && fields.protocol==='https' && fields.host?.toLowerCase()==='github.com') process.stdout.write('username=x-access-token\\npassword='+process.env.GH_TOKEN+'\\n\\n');
+if(process.argv[2]==='get' && fields.protocol==='https' && fields.host?.toLowerCase()==='github.com' && process.env.GH_TOKEN) process.stdout.write('username=x-access-token\\npassword='+process.env.GH_TOKEN+'\\n\\n');
 `;
 var shellQuote = (value) => "'" + value.replace(/'/g, "'\\''") + "'";
-function taskEnvironment(base, custom2, pat, helper) {
+function taskEnvironment(base, custom2, pat, helper, ghConfig) {
   const env = { ...base, ...custom2 };
   for (const key of Object.keys(env)) {
     if (/^GIT_CONFIG|^GIT_TRACE|^GIT_CURL|^GH_TOKEN$|^GITHUB_TOKEN$|^ACTIONS_|^RUNNER_|^GITHUB_(?:ENV|OUTPUT|PATH|STEP_SUMMARY|STATE|EVENT_PATH|WORKSPACE)$|^NODE_OPTIONS$/i.test(
@@ -23068,8 +23068,11 @@ function taskEnvironment(base, custom2, pat, helper) {
   });
   env.GIT_TERMINAL_PROMPT = "0";
   env.GCM_INTERACTIVE = "Never";
-  env.GH_TOKEN = pat;
-  env.GITHUB_TOKEN = pat;
+  env.GH_CONFIG_DIR = ghConfig;
+  if (pat) {
+    env.GH_TOKEN = pat;
+    env.GITHUB_TOKEN = pat;
+  }
   return env;
 }
 async function runScript(spec, pat, cwd, control, logPath) {
@@ -23077,7 +23080,9 @@ async function runScript(spec, pat, cwd, control, logPath) {
   const powershell = /^(pwsh|powershell)(\.exe)?$/i.test(interpreter);
   const script = (0, import_node_path11.join)(control, powershell ? "task.ps1" : "task.sh");
   const helper = (0, import_node_path11.join)(control, "credential-helper.cjs");
+  const ghConfig = (0, import_node_path11.join)(control, "gh-config");
   await (0, import_promises4.writeFile)(helper, helperSource, { mode: 384 });
+  await (0, import_promises4.mkdir)(ghConfig, { recursive: true, mode: 448 });
   await (0, import_promises4.writeFile)(script, spec.script, { mode: 384 });
   const args = powershell ? ["-NoLogo", "-NoProfile", "-NonInteractive", "-File", script] : interpreter === "bash" ? ["--noprofile", "--norc", script] : [script];
   const log = await (0, import_promises4.open)(logPath, "a");
@@ -23085,7 +23090,7 @@ async function runScript(spec, pat, cwd, control, logPath) {
     return await new Promise((resolve4, reject) => {
       const child = (0, import_node_child_process.spawn)(interpreter, args, {
         cwd,
-        env: taskEnvironment(process.env, spec.env, pat, helper),
+        env: taskEnvironment(process.env, spec.env, pat, helper, ghConfig),
         stdio: ["ignore", log.fd, log.fd],
         windowsHide: true
       });
