@@ -22909,6 +22909,15 @@ var To = (s3) => {
 };
 
 // src/archive.ts
+function portableMode(mode, directory) {
+  let m2 = (mode & 511 | 384) & ~18;
+  if (directory) {
+    if (m2 & 256) m2 |= 64;
+    if (m2 & 32) m2 |= 8;
+    if (m2 & 4) m2 |= 1;
+  }
+  return m2;
+}
 async function inventory(root) {
   if (!(await (0, import_promises2.lstat)(root)).isDirectory() || (await (0, import_promises2.lstat)(root)).isSymbolicLink())
     throw new Error("Output root must be a directory");
@@ -22924,7 +22933,7 @@ async function inventory(root) {
         path,
         type: stat3.isDirectory() ? "directory" : "file",
         size: stat3.isFile() ? stat3.size : 0,
-        mode: stat3.mode & 511
+        mode: portableMode(stat3.mode, stat3.isDirectory())
       });
       if (entries.length > MAX_ENTRIES)
         throw new Error(`Output exceeds ${MAX_ENTRIES} entries`);
@@ -23763,9 +23772,14 @@ Nimbus: ${result.error}
       const archive = (0, import_node_path14.join)(control, "out.tar.zst");
       const entries = await pack((0, import_node_path14.join)(work, "out"), archive);
       result.artifactId = await upload(archive, "artifact", entries);
-    } catch {
+    } catch (error62) {
       result.error = [result.error, "Artifact collection or upload failed"].filter(Boolean).join("; ");
-      await (0, import_promises9.appendFile)(log, "\nNimbus: Artifact collection or upload failed\n");
+      await (0, import_promises9.appendFile)(
+        log,
+        `
+Nimbus: Artifact collection or upload failed: ${error62 instanceof Error ? error62.message : "unknown error"}
+`
+      );
     }
     await cache.save(result.exitCode === 0 && !result.error);
     try {
